@@ -1,14 +1,15 @@
 # Restaurant Assistant Backend
 
-FastAPI backend: a Claude agent (LangChain + `langchain-anthropic`) with restaurant tools, traced with LangSmith.
+FastAPI backend: a Claude agent built directly on the Anthropic Python SDK, with a simple tool-calling loop and restaurant tools.
 
 Endpoints: `POST /chat` and `GET /health`. Run: `uvicorn main:app --reload`.
 
-Environment variables (set in `.env` locally or in the host's settings; never commit them): `ANTHROPIC_API_KEY`, `CORS_ORIGINS`, `LANGSMITH_TRACING`, `LANGSMITH_API_KEY`, `LANGSMITH_PROJECT`. Optional: `MODEL` (default `anthropic:claude-haiku-5-5`).
+Environment variables (set in `.env` locally or in the host's settings; never commit them): `ANTHROPIC_API_KEY`, `CORS_ORIGINS`. Optional: `MODEL` (default `claude-haiku-5-5`).
 
 ## main.py
 
 ```python
+import json
 import logging
 import os
 
@@ -18,12 +19,10 @@ load_dotenv()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from langchain.agents import create_agent
-from langchain.chat_models import init_chat_model
-from langsmith import traceable
+from anthropic import AsyncAnthropic
 from pydantic import BaseModel, Field
 
-from tools import tools
+from tools import tool_definitions, tool_functions
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,15 +47,10 @@ your available capabilities.
 Be friendly, conversational, and concise.
 """
 
-model = init_chat_model(
-    os.getenv("MODEL", "anthropic:claude-haiku-5-5")
-)
+MODEL = os.getenv("MODEL", "claude-haiku-5-5")
+MAX_TOOL_ROUNDS = 5
 
-agent = create_agent(
-    model=model,
-    tools=tools,
-    system_prompt=system_prompt,
-)
+client = AsyncAnthropic()  # reads ANTHROPIC_API_KEY from the environment
 
 app = FastAPI(title="Restaurant Assistant API")
 
@@ -83,23 +77,47 @@ class ChatResponse(BaseModel):
     tool_calls: list[dict]
 
 
-def _text(content) -> str:
-    if isinstance(content, str):
-        return content
+def run_tool(name: str, args: dict) -> str:
+    fn = tool_functions.get(name)
+    if fn is None:
+        return f"Unknown tool: {name}"
+    try:
+        result = fn(**args)
+    except Exception as e:
+        return f"Tool error: {e}"
+    return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
 
-    if isinstance(content, list):
-        return "".join(
-            block.get("text", "")
-            for block in content
-            if isinstance(block, dict)
+
+async def invoke_claude_agent(messages: list[dict]) -> tuple[str, list[dict]]:
+    """Run Claude with tools until it gives a final answer. Returns (reply, tool_calls)."""
+    tool_calls: list[dict] = []
+
+    for _ in range(MAX_TOOL_ROUNDS):
+        response = await client.messages.create(
+            model=MODEL,
+            max_tokens=1024,
+            system=system_prompt,
+            tools=tool_definitions,
+            messages=messages,
         )
 
-    return str(content) if content is not None else ""
+        if response.stop_reason != "tool_use":
+            reply = "".join(b.text for b in response.content if b.type == "text")
+            return reply, tool_calls
 
+        messages.append({"role": "assistant", "content": response.content})
 
-@traceable(name="Claude Restaurant Agent", run_type="chain")
-async def invoke_claude_agent(messages: list[dict]):
-    return await agent.ainvoke({"messages": messages})
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                output = run_tool(block.name, block.input)
+                tool_calls.append({"name": block.name, "output": output})
+                results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": output}
+                )
+        messages.append({"role": "user", "content": results})
+
+    return "Sorry, I couldn't complete that request.", tool_calls
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -108,7 +126,7 @@ async def chat(req: ChatRequest):
     messages.append({"role": "user", "content": req.message})
 
     try:
-        result = await invoke_claude_agent(messages)
+        reply, tool_calls = await invoke_claude_agent(messages)
     except Exception:
         logger.exception("Claude agent invocation failed")
         raise HTTPException(
@@ -116,23 +134,7 @@ async def chat(req: ChatRequest):
             detail="The restaurant assistant could not process your request.",
         )
 
-    out = result["messages"]
-
-    tool_calls = [
-        {
-            "name": m.name,
-            "output": _text(m.content),
-        }
-        for m in out
-        if getattr(m, "type", None) == "tool"
-    ]
-
-    reply = _text(out[-1].content) if out else ""
-
-    return ChatResponse(
-        reply=reply,
-        tool_calls=tool_calls,
-    )
+    return ChatResponse(reply=reply, tool_calls=tool_calls)
 
 
 @app.get("/health")
@@ -143,13 +145,10 @@ async def health():
 ## tools.py
 
 ```python
-from langchain_core.tools import tool
-
 # ============================================================
 # TOOL 1: Search Restaurants by Cuisine
 # ============================================================
 
-@tool
 def search_restaurants_by_cuisine(cuisine_type: str) -> list:
     """
     Search for restaurants by cuisine type.
@@ -188,7 +187,6 @@ def search_restaurants_by_cuisine(cuisine_type: str) -> list:
 # TOOL 2: Get Restaurant Details
 # ============================================================
 
-@tool
 def get_restaurant_details(restaurant_name: str) -> dict:
     """
     Get detailed information about a restaurant,
@@ -270,7 +268,6 @@ def get_restaurant_details(restaurant_name: str) -> dict:
 # TOOL 3: Check Reservation Availability
 # ============================================================
 
-@tool
 def check_reservation_availability(
     restaurant_name: str,
     date: str,
@@ -339,7 +336,58 @@ def check_reservation_availability(
     )
 
 
-tools = [search_restaurants_by_cuisine, get_restaurant_details, check_reservation_availability]
+# ============================================================
+# Tool schemas (sent to Claude) and dispatch table
+# ============================================================
+
+tool_definitions = [
+    {
+        "name": "search_restaurants_by_cuisine",
+        "description": (
+            "Search for restaurants by cuisine type. "
+            "Supported cuisines: Indian, Italian, Chinese, Mexican."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"cuisine_type": {"type": "string"}},
+            "required": ["cuisine_type"],
+        },
+    },
+    {
+        "name": "get_restaurant_details",
+        "description": (
+            "Get detailed information about a restaurant, "
+            "including address, phone, hours and specialties."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"restaurant_name": {"type": "string"}},
+            "required": ["restaurant_name"],
+        },
+    },
+    {
+        "name": "check_reservation_availability",
+        "description": (
+            "Check if a restaurant has reservation availability "
+            "for a specific date (YYYY-MM-DD) and number of people."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "restaurant_name": {"type": "string"},
+                "date": {"type": "string"},
+                "party_size": {"type": "integer"},
+            },
+            "required": ["restaurant_name", "date", "party_size"],
+        },
+    },
+]
+
+tool_functions = {
+    "search_restaurants_by_cuisine": search_restaurants_by_cuisine,
+    "get_restaurant_details": get_restaurant_details,
+    "check_reservation_availability": check_reservation_availability,
+}
 ```
 
 ## requirements.txt
@@ -347,10 +395,8 @@ tools = [search_restaurants_by_cuisine, get_restaurant_details, check_reservatio
 ```text
 fastapi
 uvicorn[standard]
-langchain>=1.0
-langchain-anthropic
+anthropic
 pydantic
-langsmith
 python-dotenv
 ```
 
